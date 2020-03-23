@@ -21,7 +21,7 @@
                                            include_dirs => [file:dirname()], % mandatory
                                            src_ext      => extension(),      % mandatory
                                            out_mappings => out_mappings(),   % mandatory
-                                           dependencies_opts => term()}.     % optional
+                                           compile_opts => term()}.     % optional
 -callback needed_files(digraph:graph(), [file:filename()], out_mappings(),
                        rebar_app_info:t()) ->
     {{[file:filename()], term()}, % ErlFirstFiles (erl_opts global priority)
@@ -107,7 +107,7 @@ analyze_app({Compiler, G}, Contexts, AppInfo) ->
     #{src_dirs := SrcDirs,
       src_ext := SrcExt,
       out_mappings := [{_OutExt, OutPath}|_], % prune one dir for now (compat mode!)
-      dependencies_opts := DepOpts} = maps:get(AppName, Contexts),
+      compile_opts := DepOpts} = maps:get(AppName, Contexts),
     %% Local resources
     ArtifactDir = filename:join([OutDir, OutPath]),
     AbsSources = find_source_files(BaseDir, SrcExt, SrcDirs, BaseOpts),
@@ -342,4 +342,4 @@ add_to_includes(AppInfo, Dirs) ->
     rebar_app_info:opts(AppInfo, NewOpts).
 
 default_ctx() ->
-    #{dependencies_opts => []}.
+    #{compile_opts => []}.

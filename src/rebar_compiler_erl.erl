@@ -4,7 +4,7 @@
 
 -export([context/1,
          needed_files/4,
-         dependencies/3, dependencies/4,
+         dependencies/3, dependencies/4, dependencies/2,
          compile/4,
          clean/2,
          format_error/1]).
@@ -27,19 +27,18 @@ context(AppInfo) ->
     ErlOptIncludes = proplists:get_all_values(i, ErlOpts),
     InclDirs = lists:map(fun(Incl) -> filename:absname(Incl) end, ErlOptIncludes),
     AbsIncl = [filename:join([OutDir, "include"]) | InclDirs],
-    PTrans = proplists:get_all_values(parse_transform, ErlOpts),
-    Macros = [case Tup of
-                  {d,Name} -> Name;
-                  {d,Name,Val} -> {Name,Val}
-              end || Tup <- ErlOpts,
-                     is_tuple(Tup) andalso element(1,Tup) == d],
+
+    PrivIncludes = [{i, filename:join(OutDir, Src)}
+        || Src <- rebar_dir:all_src_dirs(RebarOpts, ["src"], [])],
+    ExternalIncl = [{i, Dir} || Dir <- AbsIncl],
+    CompileOpts = compile:env_compiler_options() ++
+        ExternalIncl ++ PrivIncludes ++ [return, {i, OutDir} | ErlOpts],
 
     #{src_dirs => ExistingSrcDirs,
       include_dirs => AbsIncl,
       src_ext => ".erl",
       out_mappings => Mappings,
-      dependencies_opts => [{includes, AbsIncl}, {macros, Macros},
-                            {parse_transforms, PTrans}]}.
+      compile_opts => CompileOpts}.
 
 
 needed_files(Graph, FoundFiles, _, AppInfo) ->
@@ -95,6 +94,9 @@ dependencies(Source, SourceDir, Dirs) ->
             throw(?PRV_ERROR({cannot_read_file, Source, file:format_error(Reason)}))
     end.
 
+dependencies(Source, DepOpts) ->
+    minibar_compiler_erl:dependencies(Source, DepOpts).
+
 dependencies(Source, _SourceDir, Dirs, DepOpts) ->
     OptPTrans = proplists:get_value(parse_transforms, DepOpts, []),
     try rebar_compiler_epp:deps(Source, DepOpts) of
@@ -121,7 +123,9 @@ dependencies(Source, _SourceDir, Dirs, DepOpts) ->
             throw(?PRV_ERROR({cannot_read_file, Source, Reason}))
     end.
 
-compile(Source, [{_, OutDir}], Config, ErlOpts) ->
+compile(Source, [{_, OutDir}], Config, ErlOpts0) ->
+    ModName = list_to_atom(filename:basename(Source, ".erl")),
+    ErlOpts = lists:delete({parse_transform, ModName}, ErlOpts0) -- compile:env_compiler_options(),
     case compile:file(Source, [{outdir, OutDir} | ErlOpts]) of
         {ok, _Mod} ->
             ok;

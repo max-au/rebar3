@@ -59,13 +59,12 @@ is_deps_only(State) ->
 
 handle_project_apps(Providers, State) ->
     Cwd = rebar_state:dir(State),
-    ProjectApps = rebar_state:project_apps(State),
-    {ok, ProjectApps1} = rebar_digraph:compile_order(ProjectApps),
 
     %% Run top level hooks *before* project apps compiled but *after* deps are
     rebar_hooks:run_all_hooks(Cwd, pre, ?PROVIDER, Providers, State),
 
-    ProjectApps2 = copy_and_build_project_apps(State, Providers, ProjectApps1),
+    ProjectApps = rebar_state:project_apps(State),
+    ProjectApps2 = copy_and_build_project_apps(State, Providers, ProjectApps),
     State2 = rebar_state:project_apps(State, ProjectApps2),
 
     %% build extra_src_dirs in the root of multi-app projects
@@ -154,29 +153,24 @@ prepare_compilers(State, Providers, AppInfo) ->
     rebar_hooks:run_all_hooks(AppDir, pre, ?ERLC_HOOK, Providers, AppInfo, State).
 
 run_compilers(State, _Providers, Apps, Tag) ->
-    %% Prepare a compiler digraph to be shared by all compiled applications
-    %% in a given run, providing the ability to combine their dependency
-    %% ordering and resources.
-    %% The Tag allows to create a Label when someone cares about a specific
-    %% run for compilation;
-    DAGLabel = case Tag of
-        undefined -> undefined;
-        _ -> atom_to_list(Tag)
-    end,
+    %% Execute custom builders first
+    {Rebar3, Custom} = lists:partition(
+        fun(AppInfo) ->
+            Type = rebar_app_info:project_type(AppInfo),
+            Type =:= rebar3 orelse Type =:= undefined
+        end,
+        Apps
+    ),
+    [build_custom_builder_app(AppInfo, State) || AppInfo <- Custom],
     %% The Dir for the DAG is set to deps_dir so builds taking place
     %% in different contexts (i.e. plugins) don't risk clobbering regular deps.
     Dir = rebar_dir:deps_dir(State),
-    CritMeta = [], % used to be incldirs per app
-    DAGs = [{Mod, rebar_compiler_dag:init(Dir, Mod, DAGLabel, CritMeta)}
-            || Mod <- rebar_state:compilers(State)],
-    %% Compile all the apps
-    build_apps(DAGs, Apps, State),
-    %% Potentially store shared compiler DAGs so next runs can easily
-    %% share the base information for easy re-scans.
-    lists:foreach(fun({Mod, G}) ->
-        rebar_compiler_dag:maybe_store(G, Dir, Mod, DAGLabel, CritMeta),
-        rebar_compiler_dag:terminate(G)
-    end, DAGs),
+    %% The Tag allows to create a Label when someone cares about a specific
+    %% run for compilation;
+    rebar_paths:set_paths([deps], State),
+    %% load compiler (for erlang:is_function_exported/3 to work)
+    _ = code:ensure_loaded(compile),
+    build_rebar3_apps(Dir, rebar_state:compilers(State), Tag, Rebar3, State),
     Apps.
 
 finalize_compilers(State, Providers, AppInfo) ->
@@ -220,8 +214,6 @@ build_root_extras(State, Apps) ->
     %% a fake AppInfo record that only contains the root extra_src
     %% directories, has access to all the top-level apps' public
     %% include files, and builds to a specific extra outdir.
-    %% TODO: figure out digraph strategy to properly ensure no
-    %%       cross-contamination but proper change detection.
     BaseDir = rebar_state:dir(State),
     F = fun(App) -> rebar_app_info:dir(App) == BaseDir end,
     case lists:any(F, Apps) of
@@ -232,8 +224,7 @@ build_root_extras(State, Apps) ->
             Extras = rebar_dir:extra_src_dirs(ProjOpts, []),
             {ok, VirtApp} = rebar_app_info:new("extra", "0.0.0", BaseDir, []),
             VirtApps = extra_virtual_apps(State, VirtApp, Extras),
-            %% re-use the project-apps digraph?
-            run_compilers(State, [], VirtApps, project_apps)
+            run_compilers(State, [], VirtApps, extra_apps)
     end.
 
 extra_virtual_apps(_, _, []) ->
@@ -251,24 +242,14 @@ extra_virtual_apps(State, VApp0, [Dir|Dirs]) ->
             VApp2 = rebar_app_info:ebin_dir(VApp1, OutDir),
             Opts = rebar_state:opts(State),
             VApp3 = rebar_app_info:opts(VApp2, Opts),
-            [rebar_app_info:set(VApp3, src_dirs, [OutDir])
+            VApp4 = rebar_app_info:name(VApp3, "extra" ++ Dir),
+            [rebar_app_info:set(VApp4, src_dirs, [OutDir])
              | extra_virtual_apps(State, VApp0, Dirs)]
     end.
 
 %% ===================================================================
 %% Internal functions
 %% ===================================================================
-
-build_apps(DAGs, Apps, State) ->
-    {Rebar3, Custom} = lists:partition(
-        fun(AppInfo) ->
-            Type = rebar_app_info:project_type(AppInfo),
-            Type =:= rebar3 orelse Type =:= undefined
-        end,
-        Apps
-    ),
-    [build_custom_builder_app(AppInfo, State) || AppInfo <- Custom],
-    build_rebar3_apps(DAGs, Rebar3, State).
 
 build_custom_builder_app(AppInfo, State) ->
     ?INFO("Compiling ~ts", [rebar_app_info:name(AppInfo)]),
@@ -289,32 +270,106 @@ build_custom_builder_app(AppInfo, State) ->
             throw(?PRV_ERROR({unknown_project_type, rebar_app_info:name(AppInfo), Type}))
     end.
 
-build_rebar3_apps(DAGs, Apps, _State) when DAGs =:= []; Apps =:= [] ->
-    %% No apps to actually build, probably just other compile phases
-    %% to run for non-rebar3 apps, someone wanting .app files built,
-    %% or just needing the hooks to run maybe.
+%% @private generate the name for the DAG based on the compiler module and
+%% a custom label, both of which are used to prevent various compiler runs
+%% from clobbering each other. The label `undefined' is kept for a default
+%% run of the compiler, to keep in line with previous versions of the file.
+-define(DAG_ROOT, "source").
+-define(DAG_EXT, ".dag").
+
+dag_file(Dir, CompilerMod, undefined) ->
+    filename:join([rebar_dir:local_cache_dir(Dir), CompilerMod,
+            ?DAG_ROOT ++ ?DAG_EXT]);
+dag_file(Dir, CompilerMod, Label) ->
+    filename:join([rebar_dir:local_cache_dir(Dir), CompilerMod,
+            ?DAG_ROOT ++ "_" ++ atom_to_list(Label) ++ ?DAG_EXT]).
+
+app_info_to_context(Compiler, AppInfo) ->
+    BaseDir = rebar_utils:to_list(rebar_app_info:dir(AppInfo)),
+    BaseOpts = rebar_app_info:opts(AppInfo),
+    Ctx0 = Compiler:context(AppInfo),
+    %% code from rebar_compiler:prepare_compiler_env()
+    EbinDir = rebar_utils:to_list(rebar_app_info:ebin_dir(AppInfo)),
+    %% Make sure that outdir is on the path
+    ok = rebar_file_utils:ensure_dir(EbinDir),
+    %% This is needed for parse_transforms supplied by apps
+    true = code:add_patha(filename:absname(EbinDir)),
+
+    %% zip "recursive" with directory names
+    SrcDirs = [{Dir, rebar_dir:recursive(BaseOpts, Dir)}
+        || Dir <- maps:get(src_dirs, Ctx0)],
+    %% create application context consumable by minibar
+    Ctx0#{
+        src_dirs => SrcDirs,
+        base_dir => BaseDir,
+        compiler => Compiler
+    }.
+
+extra_to_context(Compiler, AppInfo, AppDir, Dir) ->
+    OldSrcDirs = rebar_app_info:get(AppInfo, src_dirs, ["src"]),
+    EbinDir = filename:join(rebar_app_info:out_dir(AppInfo), Dir),
+    AppInfo1 = rebar_app_info:ebin_dir(AppInfo, EbinDir),
+    AppInfo2 = rebar_app_info:set(AppInfo1, src_dirs, [Dir]),
+    AppInfo3 = rebar_app_info:set(AppInfo2, extra_src_dirs, []),
+    % give access to .hrl in app's src/
+    AddSrc = [filename:join([AppDir, D]) || D <- OldSrcDirs],
+    Opts = rebar_app_info:opts(AppInfo3),
+    List = rebar_opts:get(Opts, erl_opts, []),
+    NewErlOpts = [{i, SrcDir} || SrcDir <- AddSrc] ++ List,
+    NewOpts = rebar_opts:set(Opts, erl_opts, NewErlOpts),
+    ExtraFakeApp = rebar_app_info:opts(AppInfo3, NewOpts),
+    app_info_to_context(Compiler, ExtraFakeApp).
+
+maybe_provide_extras(extra_apps, _, _, Contexts) ->
+    %% root extras, passed in a hacky way
+    Contexts;
+maybe_provide_extras(_Tag, Compiler, AppInfo, Contexts) ->
+    %% add 'extras' as separate (fake) contexts - same trick original
+    %%  rebar3 does to support extra_src_dirs
+    ExtraDirs = rebar_dir:extra_src_dirs(rebar_app_info:opts(AppInfo), []),
+    AppDir = rebar_app_info:dir(AppInfo),
+    %% fold every extra_src_dir into context
+    lists:foldl(
+        fun(Dir, CtxAccIn) ->
+            FakeCtx = extra_to_context(Compiler, AppInfo, AppDir, Dir),
+            FakeAppName = {rebar_app_info:name(AppInfo), Dir},
+            CtxAccIn#{FakeAppName => FakeCtx}
+        end,
+        Contexts,
+        [ExtraDir || ExtraDir <- ExtraDirs,
+            filelib:is_dir(filename:join(AppDir, ExtraDir))]
+    ).
+
+analyse_and_compile(Compiler, PrevDAG, Tag, Apps) ->
+    %% convert context: rebar3 needs to keep compatibility for 5 years,
+    %%  making it a really nice tool, but hard to work on
+    AppContexts = lists:foldl(
+        fun (AppInfo, CtxAcc) ->
+            Ctx = app_info_to_context(Compiler, AppInfo),
+            AppName = rebar_app_info:name(AppInfo),
+            ExtraCtxAcc = maybe_provide_extras(Tag, Compiler, AppInfo, CtxAcc),
+            %% add application itself
+            ExtraCtxAcc#{AppName => Ctx}
+        end, #{}, Apps
+    ),
+    minibar_compiler:analyse_and_compile(Compiler, PrevDAG, AppContexts).
+
+build_rebar3_apps(_Dir, [], _Tag, _Apps, _State) ->
     ok;
-build_rebar3_apps(DAGs, Apps, State) ->
-    rebar_paths:set_paths([deps], State),
-    %% To maintain output order, we need to mention each app being compiled
-    %% in order, even if the order isn't really there anymore due to each
-    %% compiler being run in broken sequence. The last compiler tends to be
-    %% the big ERLC one so we use the last compiler for the output.
-    LastDAG = lists:last(DAGs),
-    %% we actually need to compile each DAG one after the other to prevent
-    %% issues where a .yrl file that generates a .erl file gets to be seen.
-    [begin
-         {Ctx, ReorderedApps} = rebar_compiler:analyze_all(DAG, Apps),
-         lists:foreach(
-             fun(AppInfo) ->
-                DAG =:= LastDAG andalso
-                  ?INFO("Compiling ~ts", [rebar_app_info:name(AppInfo)]),
-                rebar_compiler:compile_analyzed(DAG, AppInfo, Ctx)
-             end,
-             ReorderedApps
-         )
-     end || DAG <- DAGs],
-    ok.
+build_rebar3_apps(Dir, [Compiler | Tail], Tag, Apps, State) ->
+    %% necessary for erlang:function_exported/3 to work as expected
+    %% called here for clarity as it's required by both opts_changed/2
+    %% and erl_compiler_opts_set/0 in needed_files
+    _ = code:ensure_loaded(Compiler),
+    %% Run analysis + compilation in a specific order, so yrl -> erl
+    %%  generation works and is recognised.
+    CacheFile = dag_file(Dir, Compiler, Tag),
+    PrevState = minibar_compiler:load(CacheFile),
+    {Result, NewState} = analyse_and_compile(Compiler, PrevState, Tag, Apps),
+    filelib:ensure_dir(CacheFile),
+    _ = minibar_compiler:save(CacheFile, NewState),
+    Result =/= ok andalso ?FAIL,
+    build_rebar3_apps(Dir, Tail, Tag, Apps, State).
 
 update_code_paths(State, ProjectApps) ->
     ProjAppsPaths = paths_for_apps(ProjectApps),

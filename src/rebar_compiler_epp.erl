@@ -13,8 +13,10 @@
 %% Find all Erlang code dependencies for a given file
 -spec deps(file:filename_all(), Opts) -> Attributes when
       Opts :: [Opt, ...],
-      Opt :: {includes, [file:filename_all()]}
-           | {macros, [file:filename_all()]},
+      Opt :: {i, [file:filename_all()]}
+           | {d, {term(), term()}}
+           | {d, term()}
+           | {parse_transforms, [atom()]},
                       %% following are all required, OTP-18 don't like it though
       Attributes :: #{include => [file:filename_all()],
                       missing_include_file => [file:filename_all()],
@@ -23,9 +25,14 @@
                       parse_transform => [atom()],
                       is_behaviour => boolean()}.
 deps(File, Opts) ->
-    {EppOpts, ExtraOpts} = split_opts(Opts),
-    {ok, Forms} = epp:parse_file(File, EppOpts),
-    normalize(handle_forms(Forms, default_attrs(), ExtraOpts)).
+    Macros = [case Tup of
+                  {d,Name} -> Name;
+                  {d,Name,Val} -> {Name,Val}
+              end || Tup <- Opts,
+        is_tuple(Tup) andalso element(1,Tup) == d],
+    Includes = proplists:get_all_values(i, Opts),
+    {ok, Forms} = epp:parse_file(File, [{includes, Includes}, {macros, Macros}]),
+    normalize(handle_forms(Forms, default_attrs(), Opts)).
 
 %% Find the path matching a given erlang module
 resolve_module(Mod, Paths) ->
@@ -139,16 +146,6 @@ handle_form({function, _Line, behavior_info, 1, _}, Map, _Opts) ->
 %% Skip the rest
 handle_form(_, Map, _Opts) ->
     Map.
-
-split_opts(Opts) ->
-    %% Extra Opts are options we added to palliate to issues we had
-    %% with resolving include_libs and other things in EPP.
-    lists:partition(
-        fun({OptName, _}) ->
-            not lists:member(OptName, [include_libs, parse_transforms])
-        end,
-        Opts
-    ).
 
 find_include_with_opts(Path, Opts) ->
     InclPaths = proplists:get_value(include_libs, Opts, []),

@@ -52,11 +52,16 @@ format_error(Reason) ->
     io_lib:format("~p", [Reason]).
 
 build_locks(State) ->
-    AllDeps = rebar_state:lock(State),
-    [begin
-        %% If source is tuple it is a source dep
-        %% e.g. {git, "git://github.com/ninenines/cowboy.git", "master"}
-        {rebar_app_info:name(Dep),
-         rebar_fetch:lock_source(Dep, State),
-         rebar_app_info:dep_level(Dep)}
-     end || Dep <- AllDeps, not(rebar_app_info:is_checkout(Dep))].
+    NonCheckoutDeps = [Dep || Dep <- rebar_state:lock(State), not(rebar_app_info:is_checkout(Dep))],
+    rebar_parallel:queue(
+        NonCheckoutDeps,
+        fun build_lock/2, State,
+        fun (Dep, _) -> {ok, Dep} end, []
+    ).
+
+build_lock(Dep, State) ->
+    %% If source is tuple it is a source dep
+    %% e.g. {git, "git://github.com/ninenines/cowboy.git", "master"}
+    {rebar_app_info:name(Dep),
+        rebar_fetch:lock_source(Dep, State),
+        rebar_app_info:dep_level(Dep)}.

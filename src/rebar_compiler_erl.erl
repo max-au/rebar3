@@ -99,7 +99,7 @@ dependencies(Source, SourceDir, Dirs) ->
             throw(?PRV_ERROR({cannot_read_file, Source, file:format_error(Reason)}))
     end.
 
-dependencies(Source, _SourceDir, Dirs, DepOpts) ->
+dependencies(Source, _SourceDir, _Dirs, DepOpts) ->
     OptPTrans = proplists:get_value(parse_transforms, DepOpts, []),
     try rebar_compiler_epp:deps(Source, DepOpts) of
         #{include := AbsIncls,
@@ -110,8 +110,9 @@ dependencies(Source, _SourceDir, Dirs, DepOpts) ->
             %% TODO: check for core transforms?
             {_MissIncl, _MissInclLib} =/= {[],[]} andalso
             ?DEBUG("Missing: ~p", [{_MissIncl, _MissInclLib}]),
-            expand_file_names([module_to_erl(Mod) || Mod <- OptPTrans ++ PTrans], Dirs) ++
-            expand_file_names([module_to_erl(Mod) || Mod <- Behaviours], Dirs) ++
+            %% expand_file_names([module_to_erl(Mod) || Mod <- OptPTrans ++ PTrans], Dirs) ++
+            %% expand_file_names([module_to_erl(Mod) || Mod <- Behaviours], Dirs) ++
+            [{relative, module_to_erl(Mod)} || Mod <- OptPTrans ++ PTrans ++ Behaviours] ++
             AbsIncls
     catch
         error:{badmatch, {error, Reason}} ->
